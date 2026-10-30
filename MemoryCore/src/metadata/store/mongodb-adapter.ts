@@ -72,7 +72,7 @@ import type {
   GroupType,
   UpstreamMode,
 } from "../types.js";
-import { DEFAULT_GROUP_NAME, InstanceUpstreamWriteConflictError } from "../types.js";
+import { DEFAULT_GROUP_NAME, InstanceUpstreamWriteConflictError, DEFAULT_TASK_SENTINEL } from "../types.js";
 import { DEFAULT_PAGINATION } from "../pagination.js";
 import { buildChatMemoryAssetId } from "../utils/chat-memory-asset.js";
 import { DuplicateUserKeyError } from "./interface.js";
@@ -607,6 +607,10 @@ export class MongoMetadataStore implements IMetadataStore {
       await this.col("meta_user_keys").deleteMany({ user_id: { $in: result.deleted_ids } } as Document);
       await this.col("meta_team_members").deleteMany({ user_id: { $in: result.deleted_ids } } as Document);
       await this.col("meta_asset_acl").deleteMany({ subject_type: "user", subject_id: { $in: result.deleted_ids } } as Document);
+      // v3.3: meta_user_session_defaults 无 FK 级联 (MongoDB), 应用层清理。
+      // SQLite 侧由 FOREIGN KEY ... ON DELETE CASCADE 自动完成, 此处与之对齐,
+      // 避免用户销号后 orphan 行一直指向死 user_id/team_id (设计文档 §3.3)。
+      await this.col("meta_user_session_defaults").deleteMany({ user_id: { $in: result.deleted_ids } } as Document);
     }
     return result;
   }
@@ -960,11 +964,21 @@ export class MongoMetadataStore implements IMetadataStore {
     return result;
   }
 
+  /** 仅查询成员关系；资源过滤、total 和分页仍由数据库完成。 */
+  private async teamResourceReadFilter(ownerField: "owner_user_id" | "creator_user_id", userId?: string): Promise<Document> {
+    if (userId === undefined) return {};
+    const teamIds = await this.col("meta_team_members").distinct("team_id", { user_id: userId, status: "active" });
+    const teamFilter: Document = { team_id: { $in: teamIds } };
+    if (ownerField === "owner_user_id") teamFilter.visibility = "team";
+    return { $or: [{ [ownerField]: userId }, teamFilter] };
+  }
+
   async listAgentsByTeam(teamId: string, pagination?: PaginationParams | null, filter?: AgentFilter): Promise<ListPage<AgentEntity>> {
     const q: Document = { team_id: teamId };
     if (filter?.status) q.status = filter.status;
     if (filter?.owner_user_id) q.owner_user_id = filter.owner_user_id;
     if (filter?.name) q.name = filter.name;
+    if (filter?.readable_by_user_id !== undefined) Object.assign(q, await this.teamResourceReadFilter("owner_user_id", filter.readable_by_user_id));
     return this.paginatedFind("meta_agents", q, pagination, { created_at: -1 }, (d) => d as AgentEntity);
   }
 
@@ -972,6 +986,7 @@ export class MongoMetadataStore implements IMetadataStore {
     const q: Document = { owner_user_id: userId };
     if (filter?.status) q.status = filter.status;
     if (filter?.name) q.name = filter.name;
+    if (filter?.readable_by_user_id !== undefined) Object.assign(q, await this.teamResourceReadFilter("owner_user_id", filter.readable_by_user_id));
     return this.paginatedFind("meta_agents", q, pagination, { created_at: -1 }, (d) => d as AgentEntity);
   }
 
@@ -979,6 +994,12 @@ export class MongoMetadataStore implements IMetadataStore {
   // Task
   // ============================================================
   async createTask(input: CreateTaskInput): Promise<TaskEntity> {
+    // v3.3 reserved id 守卫 (与 sqlite-adapter.createTask 对称, 见彼处注释)。
+    if (input.task_id === DEFAULT_TASK_SENTINEL) {
+      throw new Error(
+        `createTask: task_id "${DEFAULT_TASK_SENTINEL}" is reserved by Proxy sessionInit.defaultTaskId as a virtual "no-task" marker; let store auto-generate task_id instead`,
+      );
+    }
     const now = nowIso();
     for (let attempt = 0; attempt < PK_RETRY_LIMIT; attempt++) {
       const task: TaskEntity = {
@@ -1046,6 +1067,7 @@ export class MongoMetadataStore implements IMetadataStore {
     if (filter?.status) q.status = filter.status;
     if (filter?.creator_user_id) q.creator_user_id = filter.creator_user_id;
     if (filter?.title) q.title = filter.title;
+    if (filter?.readable_by_user_id !== undefined) Object.assign(q, await this.teamResourceReadFilter("creator_user_id", filter.readable_by_user_id));
     return this.paginatedFind("meta_tasks", q, pagination, { created_at: -1 }, (d) => d as TaskEntity);
   }
 
@@ -1054,6 +1076,7 @@ export class MongoMetadataStore implements IMetadataStore {
     if (filter.status) q.status = filter.status;
     if (filter.creator_user_id) q.creator_user_id = filter.creator_user_id;
     if (filter.title) q.title = filter.title;
+    if (filter.readable_by_user_id !== undefined) Object.assign(q, await this.teamResourceReadFilter("creator_user_id", filter.readable_by_user_id));
     return this.paginatedFind("meta_tasks", q, pagination, { created_at: -1 }, (d) => d as TaskEntity);
   }
 
@@ -1533,12 +1556,20 @@ export class MongoMetadataStore implements IMetadataStore {
   // UserSessionDefault (v3.3) — 用户级 (team, agent, task) 默认三元组
   // ============================================================
 
-  async getUserSessionDefault(userId: string): Promise<UserSessionDefaultEntity | null> {
+  async getUserSessionDefault(userId: string, workspaceId: string = ""): Promise<UserSessionDefaultEntity | null> {
     const doc = await this.col("meta_user_session_defaults").findOne(
-      { user_id: userId },
+      { user_id: userId, workspace_id: workspaceId },
       PROJECT_NO_ID,
     );
     return doc ? (doc as unknown as UserSessionDefaultEntity) : null;
+  }
+
+  async listUserSessionDefaults(userId: string): Promise<UserSessionDefaultEntity[]> {
+    const docs = await this.col("meta_user_session_defaults")
+      .find({ user_id: userId }, { projection: PROJECT_NO_ID })
+      .sort({ workspace_id: 1 })
+      .toArray();
+    return docs as unknown as UserSessionDefaultEntity[];
   }
 
   async upsertUserSessionDefault(
@@ -1547,8 +1578,9 @@ export class MongoMetadataStore implements IMetadataStore {
     const now = nowIso();
     // upsert: 存在则更新 team/agent/task + updated_at, 不存在则插入含 created_at。
     // 不用 _id = user_id 的习惯 —— 保持与 SQLite 的字段结构字节一致(避免序列化处漂移)。
+    const workspaceId = input.workspace_id ?? "";
     await this.col("meta_user_session_defaults").findOneAndUpdate(
-      { user_id: input.user_id },
+      { user_id: input.user_id, workspace_id: workspaceId },
       {
         $set: {
           team_id: input.team_id,
@@ -1558,20 +1590,22 @@ export class MongoMetadataStore implements IMetadataStore {
         },
         $setOnInsert: {
           user_id: input.user_id,
+          workspace_id: workspaceId,
           created_at: now,
         },
       },
       { upsert: true, returnDocument: "after" },
     );
-    const row = await this.getUserSessionDefault(input.user_id);
+    const row = await this.getUserSessionDefault(input.user_id, workspaceId);
     if (!row) {
       throw new Error("upsertUserSessionDefault: row disappeared after write");
     }
     return row;
   }
 
-  async deleteUserSessionDefault(userId: string): Promise<number> {
-    const res = await this.col("meta_user_session_defaults").deleteOne({ user_id: userId });
+  async deleteUserSessionDefault(userId: string, workspaceId: string = ""): Promise<number> {
+    const res = await this.col("meta_user_session_defaults")
+      .deleteOne({ user_id: userId, workspace_id: workspaceId });
     return res.deletedCount ?? 0;
   }
 

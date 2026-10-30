@@ -115,6 +115,7 @@ export async function handleSessionInit(
   userKey?: string,
   spaceId?: string,
   presetIdentity?: PresetIdentity,
+  workspaceId: string = "",
 ): Promise<SessionInitResult> {
   if (agentSource === "claude-code") {
     return ccHandle(
@@ -133,6 +134,8 @@ export async function handleSessionInit(
       userKey,
       spaceId,
       presetIdentity,
+      agentSource,
+      workspaceId,
     );
   }
   // 同上：整个 reqCtx 透传给 CB 状态机。codexHandler 会把 body.input[] 塞在
@@ -147,6 +150,7 @@ export async function handleSessionInit(
     spaceId,
     presetIdentity,
     agentSource,
+    workspaceId,
   );
 
   // WorkBuddy 客户端复用 CB 状态机（uninitialized → pending_team → pending_agent_task
@@ -177,6 +181,9 @@ export async function handleSessionInit(
       retry: cbFd.retry,
       stream: reqCtx.stream,
       modelId: reqCtx.modelId,
+      // v3.3: 账户默认失效原因透传给 WB form（卡片模式 + 下方文字模式两条路径
+      // 都用这份 wbFd），否则 WB 客户端看不到"为什么没走默认配置"。
+      notice: cbFd.notice,
     };
     // 能力探测：新版 WorkBuddy 官方 tools 集合里拿掉了 AskUserQuestion，
     // 继续发 tool_calls SSE 客户端会收下但不渲染 → 卡死在 pending。
@@ -219,6 +226,8 @@ export async function handleSessionInit(
       // dsh v0.1.x 走 openai /v1/chat/completions(handler 层 reqCtx.protocol="openai"
       // 或 undefined)。form builder 按此分支挑 SSE 骨架,见 dsh/form.ts buildFormResponse。
       protocol: reqCtx.protocol,
+      // v3.3: 账户默认失效原因透传（同 workbuddy 段）。
+      notice: cbFd.notice,
     };
     result.response = buildDshFormResponse(dshFd);
   }
@@ -250,6 +259,8 @@ export async function handleSessionInit(
       retry: cbFd.retry,
       stream: reqCtx.stream,
       modelId: reqCtx.modelId,
+      // v3.3: 账户默认失效原因透传（同 workbuddy / dsh 段）。
+      notice: cbFd.notice,
     };
     result.response = buildOpencodeFormResponse(ocFd);
   }

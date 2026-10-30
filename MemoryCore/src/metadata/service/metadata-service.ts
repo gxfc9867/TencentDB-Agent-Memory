@@ -105,6 +105,9 @@ import {
   DEFAULT_GROUP_NAME,
   EXTRACTION_GROUP_NAME,
   InstanceUpstreamWriteConflictError,
+  // v3.3 user-session-default: Proxy sessionInit.defaultTaskId 的虚拟值字面量,
+  // Service 层用它来拒绝新建 id="default" 的真实 Task (reserved id 守卫)。
+  DEFAULT_TASK_SENTINEL,
 } from "../types.js";
 import { formatListResult, paginateArray, resolvePagination, wrapPaginated, DEFAULT_PAGINATION } from "../pagination.js";
 import { generateId, ID_PREFIX } from "../utils/id-generator.js";
@@ -998,6 +1001,12 @@ export class MetadataService {
     return this.store.getAgentById(agentId);
   }
 
+  async getAgentForCaller(agentId: string, ctx: V3AuthContext): Promise<AgentEntity | null> {
+    const agent = await this.getAgentById(agentId);
+    if (!agent || !await this.canReadTeamResource(ctx, agent.team_id, agent.owner_user_id, agent.visibility === "team")) return null;
+    return agent;
+  }
+
   async updateAgent(agentId: string, patch: Partial<AgentEntity>): Promise<AgentEntity> {
     if (!(await this.getAgentById(agentId))) throw new MetadataError("agent_not_found", `agent not found: ${agentId}`);
     const updated = await this.store.updateAgent(agentId, patch);
@@ -1006,6 +1015,18 @@ export class MetadataService {
   }
 
   async deleteAgents(agentIds: string[]): Promise<BatchDeleteResult> {
+    // v3.4：真删除前清理各 agent 的记忆内容（L0-L3/向量/文件）；
+    // chat_memory 资产记录由 store.deleteAgents 级联删除。
+    for (const agentId of agentIds) {
+      const existing = await this.getAgentById(agentId);
+      if (!existing) continue;
+      if (this._chatMemoryContentCleaner) {
+        await this._chatMemoryContentCleaner({
+          teamId: existing.team_id,
+          agentId: existing.agent_id,
+        });
+      }
+    }
     return this.store.deleteAgents(agentIds);
   }
 
@@ -1048,24 +1069,38 @@ export class MetadataService {
   async archiveAgent(agentId: string): Promise<AgentEntity> {
     const existing = await this.getAgentById(agentId);
     if (!existing) throw new MetadataError("agent_not_found", `agent not found: ${agentId}`);
-    const archived = await this.updateAgent(agentId, { status: "inactive" });
-
-    if (this._chatMemoryContentCleaner) {
-      await this._chatMemoryContentCleaner({
-        teamId: existing.team_id,
-        agentId: existing.agent_id,
-      });
-    }
-
-    const selfMemoryAssetId = buildChatMemoryAssetId(existing.team_id, existing.agent_id);
-    await this.store.deleteAssets([selfMemoryAssetId]);
-    return archived;
+    // v3.4 语义对齐：归档 = 可逆停用（仅 status→inactive），不再清理记忆/资产。
+    // 记忆内容与 chat_memory 资产的彻底清除移至 deleteAgents（真删除）路径。
+    return await this.updateAgent(agentId, { status: "inactive" });
   }
 
   // ============================================================
-  // Task（校验 team 存在 + linked agents 同 team）
+  // Task（校验 team 存在 + linked agents 同 team + reserved id 守卫）
   // ============================================================
+  //
+  // Reserved id 守卫 (v3.3 user-session-default):
+  //   禁止 task_id 显式传入 DEFAULT_TASK_SENTINEL ("default")。
+  //
+  //   背景: Proxy sessionInit.defaultTaskId 把字面量 "default" 用作
+  //   "不绑定任何 Task" 的虚拟值 (Proxy 10+ 处 `task_id === config.defaultTaskId`
+  //   短路识别)。若让运营真的建一条 id="default" 的 TaskEntity, 整条短路链路
+  //   会在"命中真实 task 但按虚拟值处理" —— 该 task 永远拿不到参与日志 /
+  //   skill 召回 / task context, 变成 dormant bug。
+  //
+  //   校验只对**新建**生效; 历史脏数据 (若有) 不受影响, 不会卡升级。详见
+  //   MemoryProxy/docs/design/2026-10-10-user-session-default-design.md §4.2。
+  //
+  //   深度防御: service + store 两层都挡, store 层守 service 可能被绕过
+  //   (如数据迁移脚本直调 store) 的场景; Router 层 taskCreateSchema 本来就
+  //   不接受 task_id 参数, 构成三层防线。
   async createTask(input: CreateTaskInput): Promise<TaskEntity> {
+    // Reserved id 守卫: 本人在最前拦一次, 快速失败不触及后续校验与 store 事务。
+    if (input.task_id === DEFAULT_TASK_SENTINEL) {
+      throw new MetadataError(
+        "reserved_task_id",
+        `task_id "${DEFAULT_TASK_SENTINEL}" is reserved (used by Proxy sessionInit.defaultTaskId as a virtual "no-task" marker); please let the system auto-generate task_id instead`,
+      );
+    }
     await this.assertTeamExists(input.team_id);
     for (const link of input.linked_agents ?? []) {
       const agent = await this.getAgentById(link.agent_id);
@@ -1084,6 +1119,12 @@ export class MetadataService {
 
   async getTaskById(taskId: string): Promise<TaskEntity | null> {
     return this.store.getTaskById(taskId);
+  }
+
+  async getTaskForCaller(taskId: string, ctx: V3AuthContext): Promise<TaskEntity | null> {
+    const task = await this.getTaskById(taskId);
+    if (!task || !await this.canReadTeamResource(ctx, task.team_id, task.creator_user_id)) return null;
+    return task;
   }
 
   async updateTask(taskId: string, patch: Partial<TaskEntity>): Promise<TaskEntity> {
@@ -1802,6 +1843,21 @@ export class MetadataService {
     return ctx.userId;
   }
 
+  /** 列表读取范围只取认证身份，避免请求中的 owner/creator 改变调用者权限。 */
+  getTeamResourceReadFilterForCaller(ctx: V3AuthContext): Pick<AgentFilter, "readable_by_user_id"> {
+    return { readable_by_user_id: ctx.isSystemAdmin ? undefined : this.requireCallerId(ctx) };
+  }
+
+  /** 保留 owner / system_admin 权限；其他活跃成员只可读取允许团队共享的资源。 */
+  private async canReadTeamResource(ctx: V3AuthContext, teamId: string, ownerUserId: string, allowTeamMembers = true): Promise<boolean> {
+    if (ctx.isSystemAdmin) return true;
+    if (!ctx.userId) return false;
+    if (ctx.userId === ownerUserId) return true;
+    if (!allowTeamMembers) return false;
+    const member = await this.store.getTeamMember(teamId, ctx.userId);
+    return member?.status === "active";
+  }
+
   private assertCallerIsResourceOwner(ctx: V3AuthContext, ownerUserId: string): void {
     const callerId = this.requireCallerId(ctx);
     if (callerId !== ownerUserId) {
@@ -2249,6 +2305,9 @@ export class MetadataService {
       base_url: string;
       api_key?: string;
       model_id?: string;
+      model_ids?: string[];
+      /** P3: 团队专属组归属（空 = 全局）。 */
+      team_id?: string;
       description?: string;
     },
     supportedAgents: SupportedAgent[],
@@ -2276,6 +2335,8 @@ export class MetadataService {
         base_url: input.base_url.trim(),
         api_key: input.api_key ?? "",
         model_id: input.model_id ?? "",
+        model_ids: input.model_ids,
+        team_id: input.team_id ?? "",
         description: input.description ?? "",
       });
       return this.toPublicGroup(row);
@@ -2296,6 +2357,7 @@ export class MetadataService {
       base_url?: string;
       api_key?: string;
       model_id?: string;
+      model_ids?: string[];
       description?: string;
       expected_version?: number;
     },
@@ -2305,15 +2367,14 @@ export class MetadataService {
       throw new MetadataError("USE_EXTRACTION_ENDPOINT", "use /extraction/update for extraction row");
     }
 
-    // default 组的 immutable 字段守卫
+    // default 组的 immutable 字段守卫。
+    // P2 起 base_url/api_key/model_id/model_ids/description 可编辑（默认上游可视化）：
+    //   - base_url 留空 = 沿用 config.yaml 全局 upstream
+    //   - name/mode 仍不可改（保持 official 语义）
     if (input.group_type === "default") {
       const rejected: string[] = [];
       if (input.name !== undefined) rejected.push("name");
       if (input.mode !== undefined) rejected.push("mode");
-      if (input.base_url !== undefined) rejected.push("base_url");
-      if (input.api_key !== undefined) rejected.push("api_key");
-      if (input.model_id !== undefined) rejected.push("model_id");
-      if (input.description !== undefined) rejected.push("description");
       if (rejected.length > 0) {
         throw new MetadataError(
           "DEFAULT_GROUP_IMMUTABLE_FIELDS",
@@ -2347,6 +2408,7 @@ export class MetadataService {
         base_url: input.base_url?.trim(),
         api_key: input.api_key,
         model_id: input.model_id,
+        model_ids: input.model_ids,
         description: input.description,
       });
       return this.toPublicGroup(row);
@@ -2629,6 +2691,8 @@ export class MetadataService {
       base_url: row.base_url,
       api_key_masked: row.api_key ? maskKeyValue(row.api_key) : "",
       model_id: row.model_id,
+      model_ids: row.model_ids,
+      team_id: row.team_id,
       description: row.description,
       version: row.version,
       updated_at: row.updated_at,

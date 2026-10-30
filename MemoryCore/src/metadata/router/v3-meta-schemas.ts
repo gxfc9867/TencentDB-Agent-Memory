@@ -433,17 +433,43 @@ export const configUserSetSchema = z.object({
   params: z.record(z.string().min(1), z.string()),
 });
 
+// ── ConfigParam (instance scope, system_admin only) ──
+// 实例级配置读写入口。首个用例是 team_memory.enabled 主开关
+// (see MemoryProxy/docs/design/2026-10-13-team-memory-master-switch.md)。
+export const configInstanceGetSchema = z.object({
+  module: nonEmpty,
+  param_name: z.string().min(1).optional(),
+});
+
+export const configInstanceSetSchema = z.object({
+  module: nonEmpty,
+  param_name: nonEmpty,
+  param_value: z.string(), // 允许空串; 具体合法集 (bool "0/1" / int / 任意) 由 service 的 validateParamValue 判断
+});
+
 // ── UserSessionDefault (v3.3) ──
 // 用户级 session 默认 (team, agent, task) 三元组。
 // task_id 必填非空: "不绑定任何 Task" 场景显式传字面量 "default"
 // (与 Proxy sessionInit.defaultTaskId 契约一致, 见 types.ts::DEFAULT_TASK_SENTINEL)。
 
+const workspaceIdField = z
+  .string()
+  .max(128)
+  .optional()
+  .transform((v) => (v ?? "").trim());
+
 export const userSessionDefaultGetSchema = z.object({
+  user_id: nonEmpty,
+  workspace_id: workspaceIdField,
+});
+
+export const userSessionDefaultListSchema = z.object({
   user_id: nonEmpty,
 });
 
 export const userSessionDefaultSetSchema = z.object({
   user_id: nonEmpty,
+  workspace_id: workspaceIdField,
   team_id: nonEmpty,
   agent_id: nonEmpty,
   task_id: nonEmpty,
@@ -451,6 +477,7 @@ export const userSessionDefaultSetSchema = z.object({
 
 export const userSessionDefaultDeleteSchema = z.object({
   user_id: nonEmpty,
+  workspace_id: workspaceIdField,
 });
 
 // ── InstanceUpstreamConfig (v2 模型组) ──
@@ -480,6 +507,9 @@ export const upstreamGroupsCreateSchema = z.object({
   base_url: z.string().min(1),
   api_key: z.string().optional(),
   model_id: z.string().optional(),
+  model_ids: z.array(z.string().min(1)).max(50).optional(),
+  /** P3: 团队专属组归属（空/缺省 = 全局组） */
+  team_id: z.string().optional(),
   description: z.string().optional(),
 });
 
@@ -495,6 +525,7 @@ export const upstreamGroupsUpdateSchema = z.object({
   base_url: z.string().optional(),
   api_key: z.string().optional(),
   model_id: z.string().optional(),
+  model_ids: z.array(z.string().min(1)).max(50).optional(),
   description: z.string().optional(),
 });
 
@@ -594,8 +625,11 @@ export const V3_SCHEMAS = {
   "/v3/meta/instance-quota/get": instanceQuotaGetSchema,
   "/v3/meta/config/user/get": configUserGetSchema,
   "/v3/meta/config/user/set": configUserSetSchema,
+  "/v3/meta/config/instance/get": configInstanceGetSchema,
+  "/v3/meta/config/instance/set": configInstanceSetSchema,
   // UserSessionDefault (v3.3)
   "/v3/meta/user-session-default/get": userSessionDefaultGetSchema,
+  "/v3/meta/user-session-default/list": userSessionDefaultListSchema,
   "/v3/meta/user-session-default/set": userSessionDefaultSetSchema,
   "/v3/meta/user-session-default/delete": userSessionDefaultDeleteSchema,
   // v2 InstanceUpstream (§6.A / §6.B / §6.C)

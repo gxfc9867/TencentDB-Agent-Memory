@@ -98,6 +98,7 @@ export interface TaskEntity {
  */
 export interface UserSessionDefaultEntity {
   user_id: string;
+  workspace_id: string;
   team_id: string;
   agent_id: string;
   task_id: string;
@@ -106,6 +107,8 @@ export interface UserSessionDefaultEntity {
 }
 
 export interface SetUserSessionDefaultInput {
+  /** 工作区维度；'' = 全局默认。 */
+  workspace_id?: string;
   team_id: string;
   agent_id: string;
   task_id: string;
@@ -375,24 +378,55 @@ export class MetadataClient {
    *
    * 行为:
    *   - 已配置: 返回完整 entity
-   *   - 未配置: Core 侧返 entity_not_found (code=404), 本方法吞成 `null`
+   *   - 未配置: 返回 `null`
    *   - 其他异常 (网络 / 鉴权失败): 原样抛出, 由 caller 决定降级
+   *
+   * ── "未配置"在 Core 侧有两种表达, 必须都吞成 null ──────────────────────
+   *
+   *   1. envelope `{code:0, data:null}` —— **当前线上实际路径**。
+   *      Core router 直接 `return s.userSessionDefault.get(...)`, service 层
+   *      是 `?? null`, 未设置时返回 JS null。而 `fetch()` 对 `data == null`
+   *      **无条件抛** `unexpected null data`(见本文件 fetch 实现)。
+   *
+   *   2. envelope `code=404` (entity_not_found) —— 早期注释假设的形态,
+   *      保留兼容以防 Core 后续改口径。
+   *
+   * ⚠️ 只吞这两种。真正的网络 / 鉴权 / 500 必须照常抛出 —— 否则
+   *    resolveUserSessionDefault 会把"系统故障"和"用户没配默认"混成同一个
+   *    fallbackReason="get_failed": 既污染 ClickHouse 埋点(海量假 get_failed),
+   *    又掩盖真实故障。
    */
-  async getUserSessionDefault(userId: string): Promise<UserSessionDefaultEntity | null> {
+  async getUserSessionDefault(userId: string, workspaceId: string = ""): Promise<UserSessionDefaultEntity | null> {
     try {
       return await this.fetch<UserSessionDefaultEntity>(
         "/v3/meta/user-session-default/get",
-        { user_id: userId },
+        { user_id: userId, workspace_id: workspaceId },
       );
     } catch (err) {
-      // Core 把 "未设置"表达为 envelope code=404 (entity_not_found);
-      // fetch() 层把它翻译成 Error 带 "404" 字样。
-      if (err instanceof Error && /\b404\b|entity_not_found/.test(err.message)) {
+      if (err instanceof Error) {
+        // 形态 1: 未配置 → Core 返 {code:0,data:null}, fetch 抛这个
+        if (err.message.includes("unexpected null data")) return null;
+        // 形态 2: 未配置 → envelope 404
+        if (/\b404\b|entity_not_found/.test(err.message)) return null;
+      }
+      // v3.5: Core 对未设置也可能返回 code=0 + data:null (fetch 层抛
+      // "unexpected null data"), 同样视为未配置而非异常。
+      if (err instanceof Error && /unexpected null data/.test(err.message)) {
         return null;
       }
       throw err;
     }
   }
+
+  async listUserSessionDefaults(userId: string): Promise<UserSessionDefaultEntity[]> {
+    const result = await this.fetch<{ items?: UserSessionDefaultEntity[] } | UserSessionDefaultEntity[]>(
+      "/v3/meta/user-session-default/list",
+      { user_id: userId },
+    );
+    if (Array.isArray(result)) return result;
+    return result?.items ?? [];
+  }
+
 
   /**
    * 设置 / 覆盖用户默认配置。
@@ -408,6 +442,7 @@ export class MetadataClient {
       "/v3/meta/user-session-default/set",
       {
         user_id: userId,
+        workspace_id: input.workspace_id ?? "",
         team_id: input.team_id,
         agent_id: input.agent_id,
         task_id: input.task_id,
@@ -416,10 +451,10 @@ export class MetadataClient {
   }
 
   /** 清除用户默认配置。幂等: 不存在也返 ok。 */
-  async deleteUserSessionDefault(userId: string): Promise<{ ok: true }> {
+  async deleteUserSessionDefault(userId: string, workspaceId: string = ""): Promise<{ ok: true }> {
     return this.fetch<{ ok: true }>(
       "/v3/meta/user-session-default/delete",
-      { user_id: userId },
+      { user_id: userId, workspace_id: workspaceId },
     );
   }
 
